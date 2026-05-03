@@ -6,17 +6,48 @@ interface VideoWindowProps {
 
 type SharingMode = 'camera' | 'screen';
 
+interface NetworkQuality {
+  rtt: number;
+  packetLoss: number;
+  jitter: number;
+  bandwidthEstimate: number;
+  quality: 'excellent' | 'good' | 'fair' | 'poor';
+}
+
+// 视频质量配置层级
+const VIDEO_QUALITY_LEVELS = {
+  excellent: { maxBitrate: 1500, minBitrate: 800, resolution: { width: 640, height: 480 }, framerate: 30 },
+  good: { maxBitrate: 1000, minBitrate: 500, resolution: { width: 640, height: 480 }, framerate: 30 },
+  fair: { maxBitrate: 600, minBitrate: 300, resolution: { width: 480, height: 360 }, framerate: 24 },
+  poor: { maxBitrate: 300, minBitrate: 100, resolution: { width: 320, height: 240 }, framerate: 15 }
+};
+
+// 编解码器优先级
+const PREFERRED_VIDEO_CODECS = [
+  { mimeType: 'video/H264', clockRate: 90000 },
+  { mimeType: 'video/VP8', clockRate: 90000 },
+  { mimeType: 'video/VP9', clockRate: 90000 }
+];
+
+const PREFERRED_AUDIO_CODECS = [
+  { mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
+  { mimeType: 'audio/ISAC', clockRate: 16000 },
+  { mimeType: 'audio/G722', clockRate: 8000 }
+];
+
 export function VideoWindow({ isRecording }: VideoWindowProps) {
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isMinimized, setIsMinimized] = useState(false);
   const [sharingMode, setSharingMode] = useState<SharingMode>('camera');
   const [screenShareError, setScreenShareError] = useState<string | null>(null);
+  const [networkQuality, setNetworkQuality] = useState<NetworkQuality | null>(null);
   const [peerConnection, setPeerConnection] = useState<RTCPeerConnection | null>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const currentStreamRef = useRef<MediaStream | null>(null);
   const screenShareTrackRef = useRef<MediaStreamTrack | null>(null);
+  const networkStatsIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const getBrowserName = useCallback(() => {
     const ua = navigator.userAgent;
@@ -27,12 +58,24 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
     return 'unknown';
   }, []);
 
+  // 优化的视频约束
+  const getOptimizedVideoConstraints = useCallback((quality: keyof typeof VIDEO_QUALITY_LEVELS = 'good') => {
+    const config = VIDEO_QUALITY_LEVELS[quality];
+    return {
+      width: { ideal: config.resolution.width, max: config.resolution.width },
+      height: { ideal: config.resolution.height, max: config.resolution.height },
+      frameRate: { ideal: config.framerate, max: config.framerate },
+      aspectRatio: 1.333,
+      facingMode: 'user'
+    };
+  }, []);
+
   const createScreenShareConstraints = useCallback((browser: string) => {
     const baseConstraints: MediaTrackConstraints = {
       cursor: 'always' as const,
-      width: { ideal: 1920, max: 3840 },
-      height: { ideal: 1080, max: 2160 },
-      frameRate: { ideal: 30, max: 60 }
+      width: { ideal: 1280, max: 1920 },
+      height: { ideal: 720, max: 1080 },
+      frameRate: { ideal: 30, max: 30 }
     };
 
     if (browser === 'firefox') {
@@ -70,6 +113,126 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
     ];
   }, []);
 
+  // 配置编解码器优先级
+  const configureCodecs = useCallback(async (transceivers: RTCRtpTransceiver[]) => {
+    for (const transceiver of transceivers) {
+      if (transceiver.kind === 'video' && transceiver.setCodecPreferences) {
+        const cap = RTCRtpSender.getCapabilities('video');
+        if (cap) {
+          const preferredCodecs = cap.codecs.filter(codec => 
+            PREFERRED_VIDEO_CODECS.some(pref => 
+              codec.mimeType === pref.mimeType && 
+              codec.clockRate === pref.clockRate
+            )
+          );
+          if (preferredCodecs.length > 0) {
+            transceiver.setCodecPreferences(preferredCodecs);
+            console.log('Video codecs configured:', preferredCodecs.map(c => c.mimeType));
+          }
+        }
+      }
+      
+      if (transceiver.kind === 'audio' && transceiver.setCodecPreferences) {
+        const cap = RTCRtpSender.getCapabilities('audio');
+        if (cap) {
+          const preferredCodecs = cap.codecs.filter(codec => 
+            PREFERRED_AUDIO_CODECS.some(pref => 
+              codec.mimeType === pref.mimeType && 
+              codec.clockRate === pref.clockRate
+            )
+          );
+          if (preferredCodecs.length > 0) {
+            transceiver.setCodecPreferences(preferredCodecs);
+            console.log('Audio codecs configured:', preferredCodecs.map(c => c.mimeType));
+          }
+        }
+      }
+    }
+  }, []);
+
+  // 配置发送器参数（码率自适应、分辨率降级策略）
+  const configureSenderParameters = useCallback((sender: RTCRtpSender) => {
+    if (sender.track?.kind !== 'video') return;
+    
+    const parameters = sender.getParameters();
+    
+    if (!parameters.encodings || parameters.encodings.length === 0) {
+      parameters.encodings = [{ rid: 'main' }];
+    }
+    
+    // 配置码率自适应
+    const config = VIDEO_QUALITY_LEVELS.good;
+    parameters.encodings[0].maxBitrate = config.maxBitrate * 1000;
+    parameters.encodings[0].minBitrate = config.minBitrate * 1000;
+    parameters.encodings[0].maxFramerate = config.framerate;
+    
+    // 配置分辨率降级策略 - 优先保持帧率
+    parameters.degradationPreference = 'maintain-framerate' as const;
+    
+    sender.setParameters(parameters);
+    console.log('Sender parameters configured:', parameters);
+  }, []);
+
+  // 动态调整比特率
+  const adjustBitrate = useCallback((pc: RTCPeerConnection, quality: keyof typeof VIDEO_QUALITY_LEVELS) => {
+    const config = VIDEO_QUALITY_LEVELS[quality];
+    pc.getSenders().forEach(sender => {
+      if (sender.track?.kind === 'video') {
+        const parameters = sender.getParameters();
+        if (parameters.encodings && parameters.encodings.length > 0) {
+          parameters.encodings[0].maxBitrate = config.maxBitrate * 1000;
+          parameters.encodings[0].minBitrate = config.minBitrate * 1000;
+          parameters.encodings[0].maxFramerate = config.framerate;
+          sender.setParameters(parameters);
+        }
+      }
+    });
+    console.log(`Bitrate adjusted to ${quality}:`, config);
+  }, []);
+
+  // 检测网络质量
+  const monitorNetworkQuality = useCallback(async (pc: RTCPeerConnection) => {
+    try {
+      const stats = await pc.getStats();
+      let packetLoss = 0;
+      let rtt = 0;
+      let jitter = 0;
+      let bandwidthEstimate = 0;
+
+      stats.forEach(report => {
+        if (report.type === 'outbound-rtp' && report.kind === 'video') {
+          packetLoss = report.packetsLost || 0;
+          jitter = report.jitter || 0;
+        }
+        if (report.type === 'candidate-pair' && report.nominated) {
+          rtt = report.currentRoundTripTime ? report.currentRoundTripTime * 1000 : 0;
+          bandwidthEstimate = report.availableOutgoingBitrate || 0;
+        }
+        if (report.type === 'transport') {
+          rtt = report.currentRoundTripTime ? report.currentRoundTripTime * 1000 : rtt;
+        }
+      });
+
+      let quality: NetworkQuality['quality'];
+      if (rtt < 100 && packetLoss < 1) {
+        quality = 'excellent';
+      } else if (rtt < 200 && packetLoss < 3) {
+        quality = 'good';
+      } else if (rtt < 400 && packetLoss < 5) {
+        quality = 'fair';
+      } else {
+        quality = 'poor';
+      }
+
+      const newQuality: NetworkQuality = { rtt, packetLoss, jitter, bandwidthEstimate, quality };
+      setNetworkQuality(newQuality);
+
+      adjustBitrate(pc, quality);
+    } catch (error) {
+      console.warn('Failed to get network stats:', error);
+    }
+  }, [adjustBitrate]);
+
   const handleTrackEnded = useCallback((track: MediaStreamTrack) => {
     console.log('Screen share track ended:', track);
     setScreenShareError('屏幕共享已结束');
@@ -88,32 +251,86 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
   }, [peerConnection]);
 
   const initializePeerConnection = useCallback(() => {
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
-    });
+    // 优化的 ICE 服务器配置 - 包含多个 STUN 和 TURN 服务器
+    const iceServers: RTCIceServer[] = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      // 亚洲地区 STUN 服务器
+      { urls: 'stun:stun.nextcloud.com:443' }
+    ];
+
+    const rtcConfig: RTCConfiguration = {
+      iceServers,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      iceTransportPolicy: 'all',
+      sdpSemantics: 'unified-plan'
+    };
+
+    const pc = new RTCPeerConnection(rtcConfig);
+
+    // 配置码率自适应的 bwe
+    pc.ontrack = (event) => {
+      console.log('Track received:', event.track.kind);
+    };
 
     pc.oniceconnectionstatechange = () => {
       console.log('ICE connection state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        if (networkStatsIntervalRef.current) {
+          clearInterval(networkStatsIntervalRef.current);
+        }
+        networkStatsIntervalRef.current = setInterval(() => {
+          monitorNetworkQuality(pc);
+        }, 2000);
+      }
     };
 
     pc.onconnectionstatechange = () => {
       console.log('Peer connection state:', pc.connectionState);
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        if (networkStatsIntervalRef.current) {
+          clearInterval(networkStatsIntervalRef.current);
+        }
+      }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      console.log('ICE gathering state:', pc.iceGatheringState);
+    };
+
+    pc.onnegotiationneeded = () => {
+      console.log('Negotiation needed');
     };
 
     setPeerConnection(pc);
     return pc;
-  }, []);
+  }, [monitorNetworkQuality]);
 
-  const addTrackToPeerConnection = useCallback((track: MediaStreamTrack, stream: MediaStream) => {
+  const addTrackToPeerConnection = useCallback(async (track: MediaStreamTrack, stream: MediaStream) => {
     const pc = peerConnection || initializePeerConnection();
     if (pc) {
-      pc.addTrack(track, stream);
+      const transceiver = pc.addTransceiver(track, {
+        direction: 'sendrecv',
+        streams: [stream],
+        sendEncodings: [
+          {
+            rid: 'main',
+            maxBitrate: VIDEO_QUALITY_LEVELS.good.maxBitrate * 1000,
+            maxFramerate: VIDEO_QUALITY_LEVELS.good.framerate
+          }
+        ]
+      });
+
+      configureSenderParameters(transceiver.sender);
+      await configureCodecs(pc.getTransceivers());
+
       console.log('Track added to peer connection:', track.kind);
     }
-  }, [peerConnection, initializePeerConnection]);
+  }, [peerConnection, initializePeerConnection, configureSenderParameters, configureCodecs]);
 
   const startScreenShare = useCallback(async () => {
     setScreenShareError(null);
@@ -159,7 +376,7 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
     if (screenTrack) {
       screenTrack.addEventListener('ended', () => handleTrackEnded(screenTrack));
       screenShareTrackRef.current = screenTrack;
-      addTrackToPeerConnection(screenTrack, stream);
+      await addTrackToPeerConnection(screenTrack, stream);
     }
 
     if (videoRef.current) {
@@ -183,19 +400,30 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
   const restartCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true
+        video: getOptimizedVideoConstraints('good'),
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
       currentStreamRef.current = stream;
+      
+      const audioTrack = stream.getAudioTracks()[0];
+      const videoTrack = stream.getVideoTracks()[0];
+      
+      if (audioTrack) await addTrackToPeerConnection(audioTrack, stream);
+      if (videoTrack) await addTrackToPeerConnection(videoTrack, stream);
+      
       setSharingMode('camera');
       setIsVideoEnabled(true);
     } catch (err) {
       console.error('Failed to restart camera:', err);
     }
-  }, []);
+  }, [getOptimizedVideoConstraints, addTrackToPeerConnection]);
 
   const toggleSharingMode = useCallback(() => {
     if (sharingMode === 'camera') {
@@ -227,13 +455,28 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
     async function initCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true
+          video: getOptimizedVideoConstraints('good'),
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
         currentStreamRef.current = stream;
+        
+        const audioTrack = stream.getAudioTracks()[0];
+        const videoTrack = stream.getVideoTracks()[0];
+        
+        const pc = initializePeerConnection();
+        if (audioTrack) {
+          await addTrackToPeerConnection(audioTrack, stream);
+        }
+        if (videoTrack) {
+          await addTrackToPeerConnection(videoTrack, stream);
+        }
       } catch (err) {
         console.error('Failed to get camera media:', err);
       }
@@ -244,11 +487,25 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
       if (currentStreamRef.current) {
         currentStreamRef.current.getTracks().forEach(track => track.stop());
       }
+      if (networkStatsIntervalRef.current) {
+        clearInterval(networkStatsIntervalRef.current);
+      }
       if (peerConnection) {
         peerConnection.close();
       }
     };
-  }, []);
+  }, [getOptimizedVideoConstraints, initializePeerConnection, addTrackToPeerConnection]);
+
+  const getNetworkQualityColor = () => {
+    if (!networkQuality) return 'text-gray-400';
+    switch (networkQuality.quality) {
+      case 'excellent': return 'text-green-400';
+      case 'good': return 'text-blue-400';
+      case 'fair': return 'text-yellow-400';
+      case 'poor': return 'text-red-400';
+      default: return 'text-gray-400';
+    }
+  };
 
   if (isMinimized) {
     return (
@@ -294,6 +551,13 @@ export function VideoWindow({ isRecording }: VideoWindowProps) {
         {screenShareError && (
           <div className="absolute bottom-2 left-2 right-2 bg-red-600/90 px-2 py-1 rounded text-xs text-white">
             ⚠️ {screenShareError}
+          </div>
+        )}
+        {networkQuality && (
+          <div className="absolute bottom-2 left-2 bg-black/70 px-2 py-1 rounded text-xs">
+            <span className={getNetworkQualityColor()}>
+              📶 {networkQuality.quality} | RTT: {Math.round(networkQuality.rtt)}ms
+            </span>
           </div>
         )}
       </div>
